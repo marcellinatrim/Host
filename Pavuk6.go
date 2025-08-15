@@ -39,24 +39,47 @@ import (
 
 // ====================== Config & Models ======================
 
+type TimingConfig struct {
+	RequestTimeout     time.Duration
+	HostBackoff        time.Duration
+	CheckpointInterval time.Duration
+	ProgressInterval   time.Duration
+}
+
+func (tc *TimingConfig) Validate() error {
+	if tc.RequestTimeout <= 0 {
+		return fmt.Errorf("RequestTimeout must be positive")
+	}
+	if tc.HostBackoff < 0 {
+		return fmt.Errorf("HostBackoff must be non-negative")
+	}
+	if tc.CheckpointInterval <= 0 {
+		return fmt.Errorf("CheckpointInterval must be positive")
+	}
+	if tc.ProgressInterval <= 0 {
+		return fmt.Errorf("ProgressInterval must be positive")
+	}
+	if tc.ProgressInterval > tc.CheckpointInterval {
+		return fmt.Errorf("ProgressInterval cannot exceed CheckpointInterval")
+	}
+	return nil
+}
+
 type Config struct {
-	MaxDepth           int
-	MaxConcurrency     int
-	RequestsPerSecond  float64
-	TimeoutSeconds     int
-	MaxPageSizeBytes   int
-	MaxLinksPerDomain  int
-	MaxPagesPerDomain  int
-	AllowSubdomainWWW  bool
-	CheckpointPath     string
-	FindingsPath       string
-	TargetsPath        string
-	AntibotPath        string
-	CheckpointInterval int
-	MaxContentAgeDays  int
-	VeryOldDays        int
-	HostBackoffMS      int
-	ProgressEverySec   int
+	MaxDepth          int
+	MaxConcurrency    int
+	RequestsPerSecond float64
+	MaxPageSizeBytes  int
+	MaxLinksPerDomain int
+	MaxPagesPerDomain int
+	AllowSubdomainWWW bool
+	CheckpointPath    string
+	FindingsPath      string
+	TargetsPath       string
+	AntibotPath       string
+	MaxContentAgeDays int
+	VeryOldDays       int
+	Timing            TimingConfig
 
 	WidenOnSparse        bool
 	SparseProbePages     int
@@ -66,23 +89,25 @@ type Config struct {
 
 func defaultConfig() Config {
 	return Config{
-		MaxDepth:           6,
-		MaxConcurrency:     240,
-		RequestsPerSecond:  140.0,
-		TimeoutSeconds:     12,
-		MaxPageSizeBytes:   6 * 1024 * 1024,
-		MaxLinksPerDomain:  500,
-		MaxPagesPerDomain:  200,
-		AllowSubdomainWWW:  true,
-		CheckpointPath:     "checkpoint.json",
-		FindingsPath:       "crowd_findings.jsonl",
-		TargetsPath:        "targets.txt",
-		AntibotPath:        "antibot_domains.jsonl",
-		CheckpointInterval: 60,
-		MaxContentAgeDays:  1095,
-		VeryOldDays:        0,
-		HostBackoffMS:      90,
-		ProgressEverySec:   30,
+		MaxDepth:          6,
+		MaxConcurrency:    240,
+		RequestsPerSecond: 140.0,
+		MaxPageSizeBytes:  6 * 1024 * 1024,
+		MaxLinksPerDomain: 500,
+		MaxPagesPerDomain: 200,
+		AllowSubdomainWWW: true,
+		CheckpointPath:    "checkpoint.json",
+		FindingsPath:      "crowd_findings.jsonl",
+		TargetsPath:       "targets.txt",
+		AntibotPath:       "antibot_domains.jsonl",
+		MaxContentAgeDays: 1095,
+		VeryOldDays:       0,
+		Timing: TimingConfig{
+			RequestTimeout:     12 * time.Second,
+			HostBackoff:        90 * time.Millisecond,
+			CheckpointInterval: 60 * time.Second,
+			ProgressInterval:   30 * time.Second,
+		},
 
 		WidenOnSparse:        true,
 		SparseProbePages:     60,
@@ -240,8 +265,8 @@ func NewFastClient(cfg Config) *FastClient {
 		},
 	}
 
-	h2 := &http.Client{Transport: trH2, Timeout: time.Duration(cfg.TimeoutSeconds) * time.Second}
-	h1 := &http.Client{Transport: trH1, Timeout: time.Duration(cfg.TimeoutSeconds) * time.Second}
+	h2 := &http.Client{Transport: trH2, Timeout: cfg.Timing.RequestTimeout}
+	h1 := &http.Client{Transport: trH1, Timeout: cfg.Timing.RequestTimeout}
 	lim := rate.NewLimiter(rate.Limit(cfg.RequestsPerSecond), int(math.Max(1, cfg.RequestsPerSecond)))
 
 	return &FastClient{
@@ -448,6 +473,9 @@ func main() {
 	listPath := flag.Arg(0)
 
 	cfg := defaultConfig()
+	if err := cfg.Timing.Validate(); err != nil {
+		log.Fatalf("invalid timing config: %v", err)
+	}
 	c := &Crawler{
 		cfg:       cfg,
 		client:    NewFastClient(cfg),
@@ -492,11 +520,11 @@ func (c *Crawler) Run(listPath string) error {
 		pos = c.checkpoint.Pos
 	}
 
-	checkpointEvery := time.Duration(c.cfg.CheckpointInterval) * time.Second
+	checkpointEvery := c.cfg.Timing.CheckpointInterval
 	if checkpointEvery <= 0 {
 		checkpointEvery = 60 * time.Second
 	}
-	progressEvery := time.Duration(c.cfg.ProgressEverySec) * time.Second
+	progressEvery := c.cfg.Timing.ProgressInterval
 	if progressEvery <= 0 {
 		progressEvery = 30 * time.Second
 	}
@@ -567,7 +595,7 @@ func (c *Crawler) processDomain(domain string) *DomainResult {
 	var baseFetch *FetchResult
 
 	hostNextAt := make(map[string]time.Time)
-	hostGap := time.Duration(c.cfg.HostBackoffMS) * time.Millisecond
+	hostGap := c.cfg.Timing.HostBackoff
 	waitHost := func(rawURL string) {
 		u, err := url.Parse(rawURL)
 		if err != nil {
@@ -589,7 +617,7 @@ func (c *Crawler) processDomain(domain string) *DomainResult {
 	}
 
 	for _, u := range starts {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(c.cfg.TimeoutSeconds)*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), c.cfg.Timing.RequestTimeout)
 		waitHost(u)
 		fr, err := c.client.GetEx(ctx, u, "")
 		cancel()
@@ -714,7 +742,7 @@ func (c *Crawler) processDomain(domain string) *DomainResult {
 		if item.url == baseURL {
 			fr = baseFetch
 		} else {
-			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(c.cfg.TimeoutSeconds)*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), c.cfg.Timing.RequestTimeout)
 			waitHost(item.url)
 			fr, err = c.client.GetEx(ctx, item.url, item.parent)
 			cancel()
