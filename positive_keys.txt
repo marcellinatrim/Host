@@ -1,0 +1,7 @@
+comment
+content
+text
+body
+message
+post
+reply

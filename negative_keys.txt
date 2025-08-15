@@ -1,0 +1,9 @@
+contact
+support
+поиск
+search
+subscribe
+newsletter
+login
+signin
+checkout
