@@ -58,10 +58,10 @@ type Config struct {
 	HostBackoffMS      int
 	ProgressEverySec   int
 
-	WidenOnSparse         bool
-	SparseProbePages      int
-	SparseFindsThreshold  int
-	WidenPagesCap         int
+	WidenOnSparse        bool
+	SparseProbePages     int
+	SparseFindsThreshold int
+	WidenPagesCap        int
 }
 
 func defaultConfig() Config {
@@ -128,10 +128,10 @@ type Crawler struct {
 	semaphore chan struct{}
 
 	// outputs
-	resF   *os.File
-	resBw  *bufio.Writer
-	tgtF   *os.File
-	tgtBw  *bufio.Writer
+	resF     *os.File
+	resBw    *bufio.Writer
+	tgtF     *os.File
+	tgtBw    *bufio.Writer
 	resultMu sync.Mutex
 
 	// checkpoint
@@ -173,11 +173,11 @@ type FastClient struct {
 	requests    int64
 	maxBytes    int
 	h1only      sync.Map
-	
+
 	// Anti-detection additions
-	userAgents  []string
-	uaIndex     int64
-	sessions    sync.Map // map[string]*SessionData
+	userAgents []string
+	uaIndex    int64
+	sessions   sync.Map // map[string]*SessionData
 }
 
 type SessionData struct {
@@ -197,6 +197,11 @@ func NewFastClient(cfg Config) *FastClient {
 		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0",
 		"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+		"Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
+		"Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+		"Mozilla/5.0 (iPad; CPU OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36 OPR/101.0.0.0",
+		"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
 	}
 
 	trH2 := &http.Transport{
@@ -204,7 +209,7 @@ func NewFastClient(cfg Config) *FastClient {
 		MaxIdleConns:        1024,
 		MaxIdleConnsPerHost: 64,
 		IdleConnTimeout:     30 * time.Second,
-		DisableCompression:  true, // Отключаем авто-распаковку, чтобы не ставить опасные заголовки
+		DisableCompression:  false,
 		ForceAttemptHTTP2:   true,
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: false,
@@ -220,13 +225,13 @@ func NewFastClient(cfg Config) *FastClient {
 			},
 		},
 	}
-	
+
 	trH1 := &http.Transport{
 		Proxy:               http.ProxyFromEnvironment,
 		MaxIdleConns:        1024,
 		MaxIdleConnsPerHost: 64,
 		IdleConnTimeout:     30 * time.Second,
-		DisableCompression:  true, // Аналогично для H1
+		DisableCompression:  false,
 		ForceAttemptHTTP2:   false,
 		TLSNextProto:        map[string]func(string, *tls.Conn) http.RoundTripper{},
 		TLSClientConfig: &tls.Config{
@@ -234,11 +239,11 @@ func NewFastClient(cfg Config) *FastClient {
 			MinVersion:         tls.VersionTLS12,
 		},
 	}
-	
+
 	h2 := &http.Client{Transport: trH2, Timeout: time.Duration(cfg.TimeoutSeconds) * time.Second}
 	h1 := &http.Client{Transport: trH1, Timeout: time.Duration(cfg.TimeoutSeconds) * time.Second}
 	lim := rate.NewLimiter(rate.Limit(cfg.RequestsPerSecond), int(math.Max(1, cfg.RequestsPerSecond)))
-	
+
 	return &FastClient{
 		hcH2:        h2,
 		hcH1:        h1,
@@ -252,14 +257,14 @@ func (fc *FastClient) getSessionData(host string) *SessionData {
 	if v, ok := fc.sessions.Load(host); ok {
 		return v.(*SessionData)
 	}
-	
+
 	session := &SessionData{
 		cookies:      []*http.Cookie{},
 		lastRequest:  time.Now(),
 		requestCount: 0,
 		fingerprint:  fc.generateFingerprint(host),
 	}
-	
+
 	fc.sessions.Store(host, session)
 	return session
 }
@@ -277,10 +282,10 @@ func looksLikeHTTP2FramingErr(err error) bool {
 		return false
 	}
 	errStr := strings.ToLower(err.Error())
-	return strings.Contains(errStr, "http2") && 
-		   (strings.Contains(errStr, "frame") || 
-		    strings.Contains(errStr, "stream") ||
-		    strings.Contains(errStr, "protocol"))
+	return strings.Contains(errStr, "http2") &&
+		(strings.Contains(errStr, "frame") ||
+			strings.Contains(errStr, "stream") ||
+			strings.Contains(errStr, "protocol"))
 }
 
 type FetchResult struct {
@@ -290,24 +295,24 @@ type FetchResult struct {
 	URL     string
 }
 
-func (fc *FastClient) GetEx(ctx context.Context, rawURL string) (*FetchResult, error) {
+func (fc *FastClient) GetEx(ctx context.Context, rawURL string, referer string) (*FetchResult, error) {
 	// Rate limiting
 	if err := fc.rateLimiter.Wait(ctx); err != nil {
 		return nil, err
 	}
-	
+
 	u, _ := url.Parse(rawURL)
 	host := ""
 	if u != nil {
 		host = u.Hostname()
 	}
-	
+
 	// Get or create session for this host
 	session := fc.getSessionData(host)
-	
+
 	session.mu.Lock()
 	atomic.AddInt64(&session.requestCount, 1)
-	
+
 	// Add human-like delay between requests to same host
 	timeSinceLastReq := time.Since(session.lastRequest)
 	minDelay := time.Duration(500+rand.Intn(1000)) * time.Millisecond
@@ -318,20 +323,20 @@ func (fc *FastClient) GetEx(ctx context.Context, rawURL string) (*FetchResult, e
 	}
 	session.lastRequest = time.Now()
 	session.mu.Unlock()
-	
+
 	client := fc.hcH2
 	if v, ok := fc.h1only.Load(host); ok && v.(bool) {
 		client = fc.hcH1
 	}
-	
+
 	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Enhanced headers to mimic real browser
-	fc.setRealisticHeaders(req, host, session)
-	
+	fc.setRealisticHeaders(req, host, session, referer)
+
 	resp, err := client.Do(req)
 	if err != nil && client == fc.hcH2 && looksLikeHTTP2FramingErr(err) && host != "" {
 		fc.h1only.Store(host, true)
@@ -339,22 +344,22 @@ func (fc *FastClient) GetEx(ctx context.Context, rawURL string) (*FetchResult, e
 		if e2 != nil {
 			return nil, e2
 		}
-		fc.setRealisticHeaders(req2, host, session)
+		fc.setRealisticHeaders(req2, host, session, referer)
 		resp, err = fc.hcH1.Do(req2)
 	}
-	
+
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	
+
 	// Store cookies for session persistence (ИСПРАВЛЕНО)
 	if len(resp.Cookies()) > 0 {
 		session.mu.Lock()
 		session.cookies = append(session.cookies, resp.Cookies()...)
 		session.mu.Unlock()
 	}
-	
+
 	atomic.AddInt64(&fc.requests, 1)
 	lr := io.LimitReader(resp.Body, int64(fc.maxBytes)+1)
 	body, _ := io.ReadAll(lr)
@@ -362,7 +367,7 @@ func (fc *FastClient) GetEx(ctx context.Context, rawURL string) (*FetchResult, e
 		body = body[:fc.maxBytes]
 	}
 	atomic.AddInt64(&fc.bytesRead, int64(len(body)))
-	
+
 	return &FetchResult{
 		Status:  resp.StatusCode,
 		Headers: resp.Header.Clone(),
@@ -371,13 +376,13 @@ func (fc *FastClient) GetEx(ctx context.Context, rawURL string) (*FetchResult, e
 	}, nil
 }
 
-func (fc *FastClient) setRealisticHeaders(req *http.Request, host string, session *SessionData) {
+func (fc *FastClient) setRealisticHeaders(req *http.Request, host string, session *SessionData, referer string) {
 	// Rotate user agents
 	uaIdx := atomic.AddInt64(&fc.uaIndex, 1) % int64(len(fc.userAgents))
 	userAgent := fc.userAgents[uaIdx]
-	
+
 	req.Header.Set("User-Agent", userAgent)
-	
+
 	// Browser-like headers (БЕЗ Accept-Encoding чтобы избежать проблем с распаковкой)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9,ru;q=0.8")
@@ -387,21 +392,16 @@ func (fc *FastClient) setRealisticHeaders(req *http.Request, host string, sessio
 	req.Header.Set("Sec-Fetch-Site", "none")
 	req.Header.Set("Sec-Fetch-User", "?1")
 	req.Header.Set("Upgrade-Insecure-Requests", "1")
-	
+
 	// Add DNT header occasionally
 	if rand.Intn(3) == 0 {
 		req.Header.Set("DNT", "1")
 	}
-	
-	// Set referer for non-first requests
-	session.mu.RLock()
-	reqCount := session.requestCount
-	session.mu.RUnlock()
-	
-	if reqCount > 1 && rand.Intn(2) == 0 {
-		req.Header.Set("Referer", "https://"+host+"/")
+
+	if referer != "" {
+		req.Header.Set("Referer", referer)
 	}
-	
+
 	// Add session cookies with basic validation
 	session.mu.RLock()
 	for _, cookie := range session.cookies {
@@ -413,7 +413,7 @@ func (fc *FastClient) setRealisticHeaders(req *http.Request, host string, sessio
 		}
 	}
 	session.mu.RUnlock()
-	
+
 	// Vary some headers based on user agent
 	if strings.Contains(userAgent, "Chrome") {
 		req.Header.Set("Sec-Ch-Ua", `"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"`)
@@ -591,7 +591,7 @@ func (c *Crawler) processDomain(domain string) *DomainResult {
 	for _, u := range starts {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(c.cfg.TimeoutSeconds)*time.Second)
 		waitHost(u)
-		fr, err := c.client.GetEx(ctx, u)
+		fr, err := c.client.GetEx(ctx, u, "")
 		cancel()
 		markHost(u)
 		if err != nil || fr == nil || len(fr.Body) < 64 {
@@ -616,7 +616,9 @@ func (c *Crawler) processDomain(domain string) *DomainResult {
 				if n, e := strconv.Atoi(strings.TrimSpace(retryAfter)); e == nil && n > 0 {
 					delay = time.Duration(n) * time.Second
 				} else if t, e := http.ParseTime(retryAfter); e == nil {
-					if dd := time.Until(t); dd > 0 { delay = dd }
+					if dd := time.Until(t); dd > 0 {
+						delay = dd
+					}
 				}
 			}
 			uParsed, _ := url.Parse(u)
@@ -640,10 +642,11 @@ func (c *Crawler) processDomain(domain string) *DomainResult {
 	}
 
 	type qitem struct {
-		url   string
-		depth int
+		url    string
+		depth  int
+		parent string
 	}
-	hi := []qitem{{baseURL, 0}}
+	hi := []qitem{{baseURL, 0, ""}}
 	me := []qitem{}
 	lo := []qitem{}
 	pop := func() (qitem, bool) {
@@ -664,22 +667,21 @@ func (c *Crawler) processDomain(domain string) *DomainResult {
 		}
 		return qitem{}, false
 	}
-	push := func(u string, d int) {
+	push := func(u string, d int, parent string) {
 		if d > c.cfg.MaxDepth {
 			return
 		}
 		if hasCrowdURL(u) || d == 0 {
-			hi = append(hi, qitem{u, d})
+			hi = append(hi, qitem{u, d, parent})
 			return
 		}
 		l := strings.ToLower(u)
 		if strings.Contains(l, "/blog/") || strings.Contains(l, "/news/") || strings.Contains(l, "/20") || strings.Contains(l, "#respond") {
-			me = append(me, qitem{u, d})
+			me = append(me, qitem{u, d, parent})
 			return
 		}
-		lo = append(lo, qitem{u, d})
+		lo = append(lo, qitem{u, d, parent})
 	}
-
 
 	visited := make(map[string]bool)
 	found := 0
@@ -692,6 +694,7 @@ func (c *Crawler) processDomain(domain string) *DomainResult {
 		pageBudget = 200
 	}
 	pages := 0
+	healthLogged := 0
 	allowed := map[string]bool{domain: true}
 	if c.cfg.AllowSubdomainWWW {
 		allowed["www."+domain] = true
@@ -713,7 +716,7 @@ func (c *Crawler) processDomain(domain string) *DomainResult {
 		} else {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(c.cfg.TimeoutSeconds)*time.Second)
 			waitHost(item.url)
-			fr, err = c.client.GetEx(ctx, item.url)
+			fr, err = c.client.GetEx(ctx, item.url, item.parent)
 			cancel()
 			markHost(item.url)
 			if err != nil || fr == nil || len(fr.Body) < 64 {
@@ -741,7 +744,7 @@ func (c *Crawler) processDomain(domain string) *DomainResult {
 			if u != nil {
 				hostNextAt[u.Host] = time.Now().Add(delay)
 			}
-			push(item.url, item.depth)
+			push(item.url, item.depth, item.parent)
 			continue
 		}
 
@@ -770,6 +773,14 @@ func (c *Crawler) processDomain(domain string) *DomainResult {
 			continue
 		}
 		visited[item.url] = true
+
+		if healthLogged < 10 {
+			formsCnt := doc.Find("form").Length()
+			textareasCnt := doc.Find("textarea").Length()
+			title := strings.TrimSpace(doc.Find("title").Text())
+			log.Printf("[HEALTH] %s | ct=%s len=%d forms=%d textareas=%d title=%q", fr.URL, ct, len(fr.Body), formsCnt, textareasCnt, title)
+			healthLogged++
+		}
 
 		signals := detectPlatformSignals(fr.Headers, fr.Body)
 		var dateISO string
@@ -813,7 +824,7 @@ func (c *Crawler) processDomain(domain string) *DomainResult {
 		links := c.extractLinks(doc, item.url, domain, allowed)
 		if len(links) > 0 && item.depth+1 <= c.cfg.MaxDepth {
 			for _, u := range links {
-				push(u, item.depth+1)
+				push(u, item.depth+1, item.url)
 			}
 		}
 
@@ -824,8 +835,7 @@ func (c *Crawler) processDomain(domain string) *DomainResult {
 	return res
 }
 
-
-	// ====================== Page Analysis (forms only) ======================
+// ====================== Page Analysis (forms only) ======================
 
 func (c *Crawler) findFormsOnPage(doc *goquery.Document, pageURL string, depth int, signals []string, dateISO string, isOld bool) []*Finding {
 	var out []*Finding
@@ -892,7 +902,7 @@ func (c *Crawler) findFormsOnPage(doc *goquery.Document, pageURL string, depth i
 func hasPrimaryUGC(form *goquery.Selection) bool {
 	// 1) textarea + (name id hints OR intent)
 	if form.Find("textarea").Length() > 0 {
-		nameHint := form.Find(`textarea[name*=comment], textarea[name*=content], textarea[name*=text], textarea[name*=body], textarea[name*=message], #comment`).Length() > 0
+		nameHint := form.Find(`textarea[name*=comment], textarea[name*=content], textarea[name*=text], textarea[name*=body], textarea[name*=message], textarea[name*=review], textarea[name*=feedback], textarea[name*=description], #comment`).Length() > 0
 		if nameHint || formHasUGCIntent(form) {
 			return true
 		}
@@ -1002,7 +1012,8 @@ func isContactForm(form *goquery.Selection) bool {
 	if strings.Contains(txt, "contact") || strings.Contains(txt, "support") || strings.Contains(txt, "обратная связь") ||
 		strings.Contains(txt, "связаться") || strings.Contains(txt, "напишите нам") ||
 		strings.Contains(txt, "send message") || strings.Contains(txt, "send us a message") ||
-		strings.Contains(txt, "отправить сообщение") {
+		strings.Contains(txt, "отправить сообщение") || strings.Contains(txt, "feedback") ||
+		strings.Contains(txt, "контакт") || strings.Contains(txt, "kontakt") {
 		return true
 	}
 	return false
@@ -1159,7 +1170,7 @@ func classificationPriority(class string) int {
 
 var (
 	crowdDateRX1 = regexp.MustCompile(`/20\d{2}/(0[1-9]|1[0-2])/`) // /2023/05/
-	crowdDateRX2 = regexp.MustCompile(`/\d{4}/\d{1,2}/`)          // /2023/5/
+	crowdDateRX2 = regexp.MustCompile(`/\d{4}/\d{1,2}/`)           // /2023/5/
 	crowdPathRX  = regexp.MustCompile(`forum|topic|thread|discussion|comment`)
 )
 
@@ -1202,42 +1213,45 @@ func (c *Crawler) extractLinks(doc *goquery.Document, pageURL, domain string, al
 
 func hasCrowdURL(u string) bool {
 	lu := strings.ToLower(u)
-	
+
 	// Более строгие паттерны дат
 	if crowdDateRX1.MatchString(lu) || crowdDateRX2.MatchString(lu) {
 		return true
 	}
-	
+
 	// Строгие форумные паттерны
 	hints := []string{
 		"showthread", "viewtopic", "newreply", "newthread",
 		"action=post", "mode=reply", "mode=post", "do=postreply",
 		"/discussion/", "/community/", "/board/",
+		"posting.php?mode=post", "post.php?do=newthread", "addtopic", "create-topic", "bbp-topic-form",
 	}
 	for _, h := range hints {
 		if strings.Contains(lu, h) {
 			return true
 		}
 	}
-	
+
 	// Специфические WordPress/CMS паттерны
-	if strings.Contains(lu, "#respond") {
+	if strings.Contains(lu, "#respond") || strings.Contains(lu, "?replytocom=") ||
+		strings.Contains(lu, "/comments/") || strings.Contains(lu, "comment-page-") ||
+		strings.Contains(lu, "/wp-comments-post.php") {
 		return true
 	}
-	
+
 	// Более строгие ID паттерны (только числовые)
 	if regexp.MustCompile(`[?&]p=\d+`).MatchString(lu) ||
-	   regexp.MustCompile(`[?&]post=\d+`).MatchString(lu) ||
-	   regexp.MustCompile(`[?&]id=\d+`).MatchString(lu) {
+		regexp.MustCompile(`[?&]post=\d+`).MatchString(lu) ||
+		regexp.MustCompile(`[?&]id=\d+`).MatchString(lu) {
 		return true
 	}
-	
+
 	// Блог/новости только если есть численные индикаторы
-	if (strings.Contains(lu, "/blog/") || strings.Contains(lu, "/news/")) && 
+	if (strings.Contains(lu, "/blog/") || strings.Contains(lu, "/news/")) &&
 		(strings.Contains(lu, "/20") || regexp.MustCompile(`/\d{4}/`).MatchString(lu)) {
 		return true
 	}
-	
+
 	return false
 }
 
@@ -1273,12 +1287,12 @@ func skipFileExt(u string) bool {
 	if err != nil {
 		return false
 	}
-	
+
 	path := strings.ToLower(parsed.Path)
-	exts := []string{".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico", 
-		".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", 
+	exts := []string{".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico",
+		".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
 		".zip", ".rar", ".7z", ".mp3", ".mp4", ".avi", ".mov", ".mkv", ".webm"}
-	
+
 	for _, e := range exts {
 		if strings.HasSuffix(path, e) {
 			return true
@@ -1325,12 +1339,12 @@ func detectPlatformSignals(h http.Header, body []byte) []string {
 func isAntiBot(status int, hdr http.Header, body []byte) bool {
 	lb := strings.ToLower(string(body))
 	server := strings.ToLower(strings.Join(hdr.Values("Server"), " "))
-	
+
 	// Status code checks (ИСПРАВЛЕНО: убрали 202)
 	if status == 403 || status == 429 || status == 503 {
 		return true
 	}
-	
+
 	// Server header checks
 	antibot_servers := []string{"cloudflare", "incapsula", "sucuri", "imperva", "akamai", "fastly"}
 	for _, srv := range antibot_servers {
@@ -1338,7 +1352,7 @@ func isAntiBot(status int, hdr http.Header, body []byte) bool {
 			return true
 		}
 	}
-	
+
 	// Enhanced content detection
 	antibot_phrases := []string{
 		"checking your browser", "attention required", "access denied",
@@ -1350,26 +1364,26 @@ func isAntiBot(status int, hdr http.Header, body []byte) bool {
 		"hcaptcha", "turnstile", "challenge", "verify you are human",
 		"pardon our interruption", "unusual traffic", "automated requests",
 	}
-	
+
 	for _, phrase := range antibot_phrases {
 		if strings.Contains(lb, phrase) {
 			return true
 		}
 	}
-	
+
 	// Check for common antibot JavaScript patterns
 	js_patterns := []string{
 		"navigator.webdriver", "webdriver", "phantomjs", "headless",
 		"selenium", "automation", "bot", "__nightmare",
 		"_phantom", "callphantom", "__fxdriver_unwrapped",
 	}
-	
+
 	for _, pattern := range js_patterns {
 		if strings.Contains(lb, pattern) {
 			return true
 		}
 	}
-	
+
 	// Check response headers (ИСПРАВЛЕНО: убрали server-timing из подозрительных)
 	suspicious_headers := []string{"cf-ray", "x-sucuri-id", "x-iinfo"}
 	for _, h := range suspicious_headers {
@@ -1377,7 +1391,7 @@ func isAntiBot(status int, hdr http.Header, body []byte) bool {
 			return true
 		}
 	}
-	
+
 	return false
 }
 
@@ -1396,18 +1410,19 @@ func containsAntibotContent(content string) bool {
 	return false
 }
 
+var sysErrPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`не\s+удаётся\s+получить\s+доступ`),
+	regexp.MustCompile(`this\s+site\s+can('t|not)\s+be\s+reached`),
+	regexp.MustCompile(`file\s+not\s+found|cannot\s+access\s+the\s+file`),
+	regexp.MustCompile(`ошибка\s+сервера|внутренняя\s+ошибка`),
+	regexp.MustCompile(`temporarily\s+unavailable|connection\s+timed\s*out`),
+	regexp.MustCompile(`service\s+unavailable|server\s+error`),
+	regexp.MustCompile(`site\s+is\s+down|site\s+unavailable`),
+}
+
 func isSystemErrorPage(body []byte) bool {
 	lb := strings.ToLower(string(body))
-	errRX := []*regexp.Regexp{
-		regexp.MustCompile(`не\s+удаётся\s+получить\s+доступ`),
-		regexp.MustCompile(`this\s+site\s+can('t|not)\s+be\s+reached`),
-		regexp.MustCompile(`file\s+not\s+found|cannot\s+access\s+the\s+file`),
-		regexp.MustCompile(`ошибка\s+сервера|внутренняя\s+ошибка`),
-		regexp.MustCompile(`temporarily\s+unavailable|connection\s+timed\s*out`),
-		regexp.MustCompile(`service\s+unavailable|server\s+error`),
-		regexp.MustCompile(`site\s+is\s+down|site\s+unavailable`),
-	}
-	for _, rx := range errRX {
+	for _, rx := range sysErrPatterns {
 		if rx.MatchString(lb) {
 			return true
 		}
@@ -1472,7 +1487,7 @@ func parseEnDate(lb string) (time.Time, bool) {
 		"february": time.February, "feb": time.February,
 		"march": time.March, "mar": time.March,
 		"april": time.April, "apr": time.April,
-		"may": time.May,
+		"may":  time.May,
 		"june": time.June, "jun": time.June,
 		"july": time.July, "jul": time.July,
 		"august": time.August, "aug": time.August,
@@ -1574,8 +1589,8 @@ func (c *Crawler) writeFindings(ff []*Finding) {
 			atomic.AddInt64(&c.targetsCount, 1)
 		}
 	}
-	// Флушим только каждые 10 записей или в конце
-	if len(ff) >= 10 || len(ff) > 0 {
+	// Флушим только каждые 10 записей, финальный Flush в closeResultFile
+	if len(ff) >= 10 {
 		_ = c.resBw.Flush()
 		_ = c.tgtBw.Flush()
 	}
@@ -1670,7 +1685,10 @@ func (c *Crawler) printFinalStats() {
 		readMB, reqs, atomic.LoadInt64(&c.sysErrPages))
 
 	// error kinds
-	type kv struct{ k string; v int64 }
+	type kv struct {
+		k string
+		v int64
+	}
 	var kinds []kv
 	c.errorKinds.Range(func(k, v any) bool {
 		kinds = append(kinds, kv{k: k.(string), v: atomic.LoadInt64(v.(*int64))})
@@ -1706,19 +1724,19 @@ func normalizeDomainLine(line string) string {
 }
 
 func dedupStrings(in []string) []string {
-    if len(in) == 0 {
-        return in
-    }
-    m := make(map[string]struct{}, len(in))
-    out := make([]string, 0, len(in))
-    for _, s := range in {
-        if _, ok := m[s]; ok {
-            continue
-        }
-        m[s] = struct{}{}
-        out = append(out, s)
-    }
-    return out
+	if len(in) == 0 {
+		return in
+	}
+	m := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if _, ok := m[s]; ok {
+			continue
+		}
+		m[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
 }
 
 func attrValues(sel *goquery.Selection, attr string) []string {
@@ -1775,8 +1793,8 @@ func (t *FormTracker) Add(h uint64) bool {
 }
 
 func (c *Crawler) generateFindingHash(f *Finding) uint64 {
-    key := f.Domain + "|" + f.URL + "|" + f.Classification + "|" + f.FormActionResolved + "|" + f.ContentDateISO
-    h := fnv.New64a()
-    _, _ = h.Write([]byte(key))
-    return h.Sum64()
+	key := f.Domain + "|" + f.URL + "|" + f.Classification + "|" + f.FormActionResolved + "|" + f.ContentDateISO
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(key))
+	return h.Sum64()
 }
