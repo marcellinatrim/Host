@@ -37,12 +37,41 @@ import (
 	"golang.org/x/time/rate"
 )
 
+var defaultUserAgents = []string{
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0",
+	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+}
+
+var positiveKeys = []string{
+	"comment", "content", "text", "body", "message", "post", "reply",
+}
+
+var negativeKeys = []string{
+	"contact", "support", "поиск", "search", "subscribe", "newsletter", "login", "signin", "checkout",
+}
+
+var (
+	crowdParamPRX    = regexp.MustCompile(`[?&]p=\d+`)
+	crowdParamPostRX = regexp.MustCompile(`[?&]post=\d+`)
+	crowdParamIDRX   = regexp.MustCompile(`[?&]id=\d+`)
+	crowdYearRX      = regexp.MustCompile(`/\d{4}/`)
+	enDate1RX        = regexp.MustCompile(`\b([a-z]+)\s+([0-3]?\d),\s+(20\d{2})\b`)
+	enDate2RX        = regexp.MustCompile(`\b([0-3]?\d)\s+([a-z]+)\s+(20\d{2})\b`)
+	ruDateRX         = regexp.MustCompile(`\b([0-3]?\d)\s+([a-zа-яё]+)\s+(20\d{2})\b`)
+	isoDateRX        = regexp.MustCompile(`\b(20\d{2})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b`)
+)
+
 // ====================== Config & Models ======================
 
 type Config struct {
 	MaxDepth           int
 	MaxConcurrency     int
 	RequestsPerSecond  float64
+	PerHostRPS         float64
 	TimeoutSeconds     int
 	MaxPageSizeBytes   int
 	MaxLinksPerDomain  int
@@ -66,13 +95,14 @@ type Config struct {
 
 func defaultConfig() Config {
 	return Config{
-		MaxDepth:           6,
-		MaxConcurrency:     240,
-		RequestsPerSecond:  140.0,
+		MaxDepth:           10,
+		MaxConcurrency:     16,
+		RequestsPerSecond:  8.0,
+		PerHostRPS:         0.5,
 		TimeoutSeconds:     12,
 		MaxPageSizeBytes:   6 * 1024 * 1024,
-		MaxLinksPerDomain:  500,
-		MaxPagesPerDomain:  200,
+		MaxLinksPerDomain:  200,
+		MaxPagesPerDomain:  100,
 		AllowSubdomainWWW:  true,
 		CheckpointPath:     "checkpoint.json",
 		FindingsPath:       "crowd_findings.jsonl",
@@ -81,7 +111,7 @@ func defaultConfig() Config {
 		CheckpointInterval: 60,
 		MaxContentAgeDays:  1095,
 		VeryOldDays:        0,
-		HostBackoffMS:      90,
+		HostBackoffMS:      1000,
 		ProgressEverySec:   30,
 
 		WidenOnSparse:        true,
@@ -166,13 +196,15 @@ type Crawler struct {
 // ====================== HTTP Client (ЗАМЕНА ЦЕЛОГО БЛОКА) ======================
 
 type FastClient struct {
-	hcH2        *http.Client
-	hcH1        *http.Client
-	rateLimiter *rate.Limiter
-	bytesRead   int64
-	requests    int64
-	maxBytes    int
-	h1only      sync.Map
+	hcH2         *http.Client
+	hcH1         *http.Client
+	rateLimiter  *rate.Limiter
+	bytesRead    int64
+	requests     int64
+	maxBytes     int
+	h1only       sync.Map
+	hostLimiters sync.Map
+	perHostRate  float64
 
 	// Anti-detection additions
 	userAgents []string
@@ -186,26 +218,16 @@ type SessionData struct {
 	lastRequest  time.Time
 	requestCount int64
 	fingerprint  string
+	userAgent    string
 }
 
 func NewFastClient(cfg Config) *FastClient {
-	// Realistic user agents pool
-	userAgents := []string{
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0",
-		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0",
-		"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-	}
-
 	trH2 := &http.Transport{
 		Proxy:               http.ProxyFromEnvironment,
 		MaxIdleConns:        1024,
 		MaxIdleConnsPerHost: 64,
 		IdleConnTimeout:     30 * time.Second,
-		DisableCompression:  false, // Включаем авто-распаковку контента
-		ForceAttemptHTTP2:   true,
+		ForceAttemptHTTP2:   runtime.GOOS != "windows",
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: false,
 			MinVersion:         tls.VersionTLS12,
@@ -226,7 +248,6 @@ func NewFastClient(cfg Config) *FastClient {
 		MaxIdleConns:        1024,
 		MaxIdleConnsPerHost: 64,
 		IdleConnTimeout:     30 * time.Second,
-		DisableCompression:  false, // Авто-распаковка и для H1
 		ForceAttemptHTTP2:   false,
 		TLSNextProto:        map[string]func(string, *tls.Conn) http.RoundTripper{},
 		TLSClientConfig: &tls.Config{
@@ -244,7 +265,8 @@ func NewFastClient(cfg Config) *FastClient {
 		hcH1:        h1,
 		rateLimiter: lim,
 		maxBytes:    cfg.MaxPageSizeBytes,
-		userAgents:  userAgents,
+		userAgents:  defaultUserAgents,
+		perHostRate: cfg.PerHostRPS,
 	}
 }
 
@@ -253,15 +275,30 @@ func (fc *FastClient) getSessionData(host string) *SessionData {
 		return v.(*SessionData)
 	}
 
+	idx := atomic.AddInt64(&fc.uaIndex, 1)
+	ua := fc.userAgents[idx%int64(len(fc.userAgents))]
 	session := &SessionData{
 		cookies:      []*http.Cookie{},
 		lastRequest:  time.Now(),
 		requestCount: 0,
 		fingerprint:  fc.generateFingerprint(host),
+		userAgent:    ua,
 	}
 
 	fc.sessions.Store(host, session)
 	return session
+}
+
+func (fc *FastClient) getHostLimiter(host string) *rate.Limiter {
+	if host == "" {
+		return rate.NewLimiter(rate.Limit(fc.perHostRate), 1)
+	}
+	if v, ok := fc.hostLimiters.Load(host); ok {
+		return v.(*rate.Limiter)
+	}
+	lim := rate.NewLimiter(rate.Limit(fc.perHostRate), 1)
+	fc.hostLimiters.Store(host, lim)
+	return lim
 }
 
 func (fc *FastClient) generateFingerprint(host string) string {
@@ -290,16 +327,19 @@ type FetchResult struct {
 	URL     string
 }
 
-func (fc *FastClient) GetEx(ctx context.Context, rawURL, referer string) (*FetchResult, error) {
-	// Rate limiting
-	if err := fc.rateLimiter.Wait(ctx); err != nil {
-		return nil, err
-	}
-
+func (fc *FastClient) GetEx(ctx context.Context, rawURL string) (*FetchResult, error) {
 	u, _ := url.Parse(rawURL)
 	host := ""
 	if u != nil {
 		host = u.Hostname()
+	}
+
+	if err := fc.rateLimiter.Wait(ctx); err != nil {
+		return nil, err
+	}
+	hl := fc.getHostLimiter(host)
+	if err := hl.Wait(ctx); err != nil {
+		return nil, err
 	}
 
 	// Get or create session for this host
@@ -330,17 +370,21 @@ func (fc *FastClient) GetEx(ctx context.Context, rawURL, referer string) (*Fetch
 	}
 
 	// Enhanced headers to mimic real browser
-	fc.setRealisticHeaders(req, host, session, referer)
+	fc.setRealisticHeaders(req, host, session)
 
+	start := time.Now()
 	resp, err := client.Do(req)
+	ttfb := time.Since(start)
 	if err != nil && client == fc.hcH2 && looksLikeHTTP2FramingErr(err) && host != "" {
 		fc.h1only.Store(host, true)
 		req2, e2 := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
 		if e2 != nil {
 			return nil, e2
 		}
-		fc.setRealisticHeaders(req2, host, session, referer)
+		fc.setRealisticHeaders(req2, host, session)
+		start = time.Now()
 		resp, err = fc.hcH1.Do(req2)
+		ttfb = time.Since(start)
 	}
 
 	if err != nil {
@@ -348,10 +392,22 @@ func (fc *FastClient) GetEx(ctx context.Context, rawURL, referer string) (*Fetch
 	}
 	defer resp.Body.Close()
 
-	// Store cookies for session persistence (ИСПРАВЛЕНО)
+	// Adapt host rate based on response
+	if resp.StatusCode == 429 || resp.StatusCode == 503 {
+		hl.SetLimit(0.1)
+	} else {
+		current := hl.Limit()
+		if ttfb > 1500*time.Millisecond {
+			hl.SetLimit(rate.Limit(math.Max(0.1, float64(current)/2)))
+		} else if ttfb < 500*time.Millisecond && current < rate.Limit(fc.perHostRate) {
+			hl.SetLimit(rate.Limit(math.Min(fc.perHostRate, float64(current)+0.1)))
+		}
+	}
+
+	// Store cookies for session persistence
 	if len(resp.Cookies()) > 0 {
 		session.mu.Lock()
-		session.cookies = append(session.cookies, resp.Cookies()...)
+		session.cookies = mergeCookies(session.cookies, resp.Cookies())
 		session.mu.Unlock()
 	}
 
@@ -371,16 +427,14 @@ func (fc *FastClient) GetEx(ctx context.Context, rawURL, referer string) (*Fetch
 	}, nil
 }
 
-func (fc *FastClient) setRealisticHeaders(req *http.Request, host string, session *SessionData, referer string) {
-	// Rotate user agents
-	uaIdx := atomic.AddInt64(&fc.uaIndex, 1) % int64(len(fc.userAgents))
-	userAgent := fc.userAgents[uaIdx]
+func (fc *FastClient) setRealisticHeaders(req *http.Request, host string, session *SessionData) {
+	userAgent := session.userAgent
 
 	req.Header.Set("User-Agent", userAgent)
 
-	// Browser-like headers (БЕЗ Accept-Encoding чтобы избежать проблем с распаковкой)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9,ru;q=0.8")
+	req.Header.Set("Accept-Encoding", "gzip, deflate")
 	req.Header.Set("Cache-Control", "max-age=0")
 	req.Header.Set("Sec-Fetch-Dest", "document")
 	req.Header.Set("Sec-Fetch-Mode", "navigate")
@@ -393,8 +447,13 @@ func (fc *FastClient) setRealisticHeaders(req *http.Request, host string, sessio
 		req.Header.Set("DNT", "1")
 	}
 
-	if referer != "" {
-		req.Header.Set("Referer", referer)
+	// Set referer for non-first requests
+	session.mu.RLock()
+	reqCount := session.requestCount
+	session.mu.RUnlock()
+
+	if reqCount > 1 && rand.Intn(2) == 0 {
+		req.Header.Set("Referer", "https://"+host+"/")
 	}
 
 	// Add session cookies with basic validation
@@ -443,6 +502,9 @@ func main() {
 	listPath := flag.Arg(0)
 
 	cfg := defaultConfig()
+	_ = writeLines("user_agents.txt", defaultUserAgents)
+	_ = writeLines("positive_keys.txt", positiveKeys)
+	_ = writeLines("negative_keys.txt", negativeKeys)
 	c := &Crawler{
 		cfg:       cfg,
 		client:    NewFastClient(cfg),
@@ -586,7 +648,7 @@ func (c *Crawler) processDomain(domain string) *DomainResult {
 	for _, u := range starts {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(c.cfg.TimeoutSeconds)*time.Second)
 		waitHost(u)
-		fr, err := c.client.GetEx(ctx, u, "")
+		fr, err := c.client.GetEx(ctx, u)
 		cancel()
 		markHost(u)
 		if err != nil || fr == nil || len(fr.Body) < 64 {
@@ -625,8 +687,10 @@ func (c *Crawler) processDomain(domain string) *DomainResult {
 
 		if isAntiBot(fr.Status, fr.Headers, fr.Body) {
 			c.writeAntibot(domain, fmt.Sprintf("base:%s status=%d", u, fr.Status))
-			res.Error = fmt.Errorf("antibot")
-			return res
+			if uu, err := url.Parse(u); err == nil {
+				hostNextAt[uu.Host] = time.Now().Add(5 * time.Minute)
+			}
+			continue
 		}
 		baseURL, baseFetch = u, fr
 		break
@@ -637,11 +701,10 @@ func (c *Crawler) processDomain(domain string) *DomainResult {
 	}
 
 	type qitem struct {
-		url    string
-		depth  int
-		parent string
+		url   string
+		depth int
 	}
-	hi := []qitem{{url: baseURL, depth: 0, parent: ""}}
+	hi := []qitem{{baseURL, 0}}
 	me := []qitem{}
 	lo := []qitem{}
 	pop := func() (qitem, bool) {
@@ -662,20 +725,20 @@ func (c *Crawler) processDomain(domain string) *DomainResult {
 		}
 		return qitem{}, false
 	}
-	push := func(u string, d int, p string) {
+	push := func(u string, d int) {
 		if d > c.cfg.MaxDepth {
 			return
 		}
 		if hasCrowdURL(u) || d == 0 {
-			hi = append(hi, qitem{url: u, depth: d, parent: p})
+			hi = append(hi, qitem{u, d})
 			return
 		}
 		l := strings.ToLower(u)
 		if strings.Contains(l, "/blog/") || strings.Contains(l, "/news/") || strings.Contains(l, "/20") || strings.Contains(l, "#respond") {
-			me = append(me, qitem{url: u, depth: d, parent: p})
+			me = append(me, qitem{u, d})
 			return
 		}
-		lo = append(lo, qitem{url: u, depth: d, parent: p})
+		lo = append(lo, qitem{u, d})
 	}
 
 	visited := make(map[string]bool)
@@ -710,7 +773,7 @@ func (c *Crawler) processDomain(domain string) *DomainResult {
 		} else {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(c.cfg.TimeoutSeconds)*time.Second)
 			waitHost(item.url)
-			fr, err = c.client.GetEx(ctx, item.url, item.parent)
+			fr, err = c.client.GetEx(ctx, item.url)
 			cancel()
 			markHost(item.url)
 			if err != nil || fr == nil || len(fr.Body) < 64 {
@@ -720,26 +783,6 @@ func (c *Crawler) processDomain(domain string) *DomainResult {
 			}
 		}
 		pages++
-
-		if pages <= 10 {
-			docHL, err := goquery.NewDocumentFromReader(bytes.NewReader(fr.Body))
-			var formsCnt, textareasCnt int
-			var title string
-			if err == nil {
-				formsCnt = docHL.Find("form").Length()
-				textareasCnt = docHL.Find("textarea").Length()
-				title = strings.TrimSpace(docHL.Find("title").Text())
-			}
-			log.Printf("[HEALTH] %s | ct=%s len=%d forms=%d textareas=%d title=%q ref=%s",
-				item.url,
-				strings.ToLower(strings.Join(fr.Headers.Values("Content-Type"), " ")),
-				len(fr.Body),
-				formsCnt,
-				textareasCnt,
-				title,
-				item.parent,
-			)
-		}
 
 		if fr.Status == 429 || fr.Status == 503 {
 			retryAfter := fr.Headers.Get("Retry-After")
@@ -758,12 +801,12 @@ func (c *Crawler) processDomain(domain string) *DomainResult {
 			if u != nil {
 				hostNextAt[u.Host] = time.Now().Add(delay)
 			}
-			push(item.url, item.depth, item.parent)
+			push(item.url, item.depth)
 			continue
 		}
 
 		ct := strings.ToLower(strings.Join(fr.Headers.Values("Content-Type"), " "))
-		if !strings.Contains(ct, "text/html") {
+		if !isHTMLContent(ct) {
 			c.bumpError("non_html_page")
 			visited[item.url] = true
 			continue
@@ -776,8 +819,12 @@ func (c *Crawler) processDomain(domain string) *DomainResult {
 		}
 		if isAntiBot(fr.Status, fr.Headers, fr.Body) {
 			c.writeAntibot(domain, fmt.Sprintf("crawl:%s status=%d", item.url, fr.Status))
-			res.Error = fmt.Errorf("antibot at %s", item.url)
-			return res
+			u, _ := url.Parse(item.url)
+			if u != nil {
+				hostNextAt[u.Host] = time.Now().Add(5 * time.Minute)
+			}
+			push(item.url, item.depth)
+			continue
 		}
 
 		doc, err := goquery.NewDocumentFromReader(bytes.NewReader(fr.Body))
@@ -830,7 +877,7 @@ func (c *Crawler) processDomain(domain string) *DomainResult {
 		links := c.extractLinks(doc, item.url, domain, allowed)
 		if len(links) > 0 && item.depth+1 <= c.cfg.MaxDepth {
 			for _, u := range links {
-				push(u, item.depth+1, item.url)
+				push(u, item.depth+1)
 			}
 		}
 
@@ -1228,7 +1275,6 @@ func hasCrowdURL(u string) bool {
 	hints := []string{
 		"showthread", "viewtopic", "newreply", "newthread",
 		"action=post", "mode=reply", "mode=post", "do=postreply",
-		"posting.php?mode=post", "post.php?do=newthread", "addtopic", "create-topic", "bbp-topic-form",
 		"/discussion/", "/community/", "/board/",
 	}
 	for _, h := range hints {
@@ -1238,24 +1284,20 @@ func hasCrowdURL(u string) bool {
 	}
 
 	// Специфические WordPress/CMS паттерны
-	if strings.Contains(lu, "#respond") ||
-		strings.Contains(lu, "?replytocom=") ||
-		strings.Contains(lu, "/comments/") ||
-		strings.Contains(lu, "comment-page-") ||
-		strings.Contains(lu, "/wp-comments-post.php") {
+	if strings.Contains(lu, "#respond") {
 		return true
 	}
 
 	// Более строгие ID паттерны (только числовые)
-	if regexp.MustCompile(`[?&]p=\d+`).MatchString(lu) ||
-		regexp.MustCompile(`[?&]post=\d+`).MatchString(lu) ||
-		regexp.MustCompile(`[?&]id=\d+`).MatchString(lu) {
+	if crowdParamPRX.MatchString(lu) ||
+		crowdParamPostRX.MatchString(lu) ||
+		crowdParamIDRX.MatchString(lu) {
 		return true
 	}
 
 	// Блог/новости только если есть численные индикаторы
 	if (strings.Contains(lu, "/blog/") || strings.Contains(lu, "/news/")) &&
-		(strings.Contains(lu, "/20") || regexp.MustCompile(`/\d{4}/`).MatchString(lu)) {
+		(strings.Contains(lu, "/20") || crowdYearRX.MatchString(lu)) {
 		return true
 	}
 
@@ -1417,19 +1459,18 @@ func containsAntibotContent(content string) bool {
 	return false
 }
 
-var sysErrPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`не\s+удаётся\s+получить\s+доступ`),
-	regexp.MustCompile(`this\s+site\s+can('t|not)\s+be\s+reached`),
-	regexp.MustCompile(`file\s+not\s+found|cannot\s+access\s+the\s+file`),
-	regexp.MustCompile(`ошибка\s+сервера|внутренняя\s+ошибка`),
-	regexp.MustCompile(`temporarily\s+unavailable|connection\s+timed\s*out`),
-	regexp.MustCompile(`service\s+unavailable|server\s+error`),
-	regexp.MustCompile(`site\s+is\s+down|site\s+unavailable`),
-}
-
 func isSystemErrorPage(body []byte) bool {
 	lb := strings.ToLower(string(body))
-	for _, rx := range sysErrPatterns {
+	errRX := []*regexp.Regexp{
+		regexp.MustCompile(`не\s+удаётся\s+получить\s+доступ`),
+		regexp.MustCompile(`this\s+site\s+can('t|not)\s+be\s+reached`),
+		regexp.MustCompile(`file\s+not\s+found|cannot\s+access\s+the\s+file`),
+		regexp.MustCompile(`ошибка\s+сервера|внутренняя\s+ошибка`),
+		regexp.MustCompile(`temporarily\s+unavailable|connection\s+timed\s*out`),
+		regexp.MustCompile(`service\s+unavailable|server\s+error`),
+		regexp.MustCompile(`site\s+is\s+down|site\s+unavailable`),
+	}
+	for _, rx := range errRX {
 		if rx.MatchString(lb) {
 			return true
 		}
@@ -1479,8 +1520,7 @@ func detectContentDate(doc *goquery.Document, body []byte) (time.Time, bool) {
 	if tt, ok := parseRuDate(lb); ok {
 		return tt, true
 	}
-	rx := regexp.MustCompile(`\b(20\d{2})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b`)
-	if m := rx.FindStringSubmatch(lb); len(m) == 4 {
+	if m := isoDateRX.FindStringSubmatch(lb); len(m) == 4 {
 		if t, err := time.Parse("2006-01-02", m[1]+"-"+m[2]+"-"+m[3]); err == nil {
 			return t, true
 		}
@@ -1504,7 +1544,7 @@ func parseEnDate(lb string) (time.Time, bool) {
 		"december": time.December, "dec": time.December,
 	}
 	// "March 2, 2023"
-	if m := regexp.MustCompile(`\b([a-z]+)\s+([0-3]?\d),\s+(20\d{2})\b`).FindStringSubmatch(lb); len(m) == 4 {
+	if m := enDate1RX.FindStringSubmatch(lb); len(m) == 4 {
 		if mon := months[m[1]]; mon != 0 {
 			var day, year int
 			fmt.Sscanf(m[2], "%d", &day)
@@ -1515,7 +1555,7 @@ func parseEnDate(lb string) (time.Time, bool) {
 		}
 	}
 	// "2 March 2023"
-	if m := regexp.MustCompile(`\b([0-3]?\d)\s+([a-z]+)\s+(20\d{2})\b`).FindStringSubmatch(lb); len(m) == 4 {
+	if m := enDate2RX.FindStringSubmatch(lb); len(m) == 4 {
 		if mon := months[m[2]]; mon != 0 {
 			var day, year int
 			fmt.Sscanf(m[1], "%d", &day)
@@ -1529,8 +1569,7 @@ func parseEnDate(lb string) (time.Time, bool) {
 }
 
 func parseRuDate(lb string) (time.Time, bool) {
-	rx := regexp.MustCompile(`\b([0-3]?\d)\s+([a-zа-яё]+)\s+(20\d{2})\b`)
-	if m := rx.FindStringSubmatch(lb); len(m) == 4 {
+	if m := ruDateRX.FindStringSubmatch(lb); len(m) == 4 {
 		mon := ruMonth[m[2]]
 		if mon != 0 {
 			var day, year int
@@ -1596,8 +1635,8 @@ func (c *Crawler) writeFindings(ff []*Finding) {
 			atomic.AddInt64(&c.targetsCount, 1)
 		}
 	}
-	// Флушим только каждые 10 записей; финальный Flush выполняется при закрытии файлов
-	if len(ff) >= 10 {
+	// Флушим только каждые 10 записей или в конце
+	if len(ff) >= 10 || len(ff) > 0 {
 		_ = c.resBw.Flush()
 		_ = c.tgtBw.Flush()
 	}
@@ -1804,4 +1843,41 @@ func (c *Crawler) generateFindingHash(f *Finding) uint64 {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(key))
 	return h.Sum64()
+}
+
+func writeLines(path string, lines []string) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	w := bufio.NewWriter(f)
+	for _, l := range lines {
+		if _, err := w.WriteString(l + "\n"); err != nil {
+			return err
+		}
+	}
+	return w.Flush()
+}
+
+func mergeCookies(existing []*http.Cookie, incoming []*http.Cookie) []*http.Cookie {
+	now := time.Now()
+	m := make(map[string]*http.Cookie, len(existing)+len(incoming))
+	for _, c := range existing {
+		if c.Expires.IsZero() || c.Expires.After(now) {
+			key := c.Name + "|" + c.Domain + "|" + c.Path
+			m[key] = c
+		}
+	}
+	for _, c := range incoming {
+		if c.Expires.IsZero() || c.Expires.After(now) {
+			key := c.Name + "|" + c.Domain + "|" + c.Path
+			m[key] = c
+		}
+	}
+	out := make([]*http.Cookie, 0, len(m))
+	for _, c := range m {
+		out = append(out, c)
+	}
+	return out
 }
